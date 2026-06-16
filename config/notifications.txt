@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────
+#  proactive-slacks routing table
+# ─────────────────────────────────────────────────────────────────────────
+#  Each row:   <topic>   <channel>   <level>   [push]
+#
+#    topic    a dotted name you choose. Your assistant picks one per ping.
+#    channel  a #channel-name  OR  DM
+#    level    silent | fyi | ask | urgent   (how LOUD, independent of channel)
+#               silent = log only, no message
+#               fyi    = post, no push
+#               ask    = post; message leads with what the assistant needs
+#               urgent = post + lock-screen push (needs PSLACK_PUSH_CMD)
+#    push     optional 4th word: force a push regardless of level
+#
+#  channel = WHERE it lands. level = HOW LOUD. They are independent.
+#  Edit a row, save, done — the table is re-read on every call. No restart.
+#  Lines starting with # are ignored.
+#
+#  No row for a topic? It falls back to its category prefix, then `default`.
+#  Nothing is ever silently dropped.
+# ─────────────────────────────────────────────────────────────────────────
+
+# --- This is an EXAMPLE. Replace topics + channels with your own. ---
+
+# Reports / metrics
+reports.daily          #my-reports     fyi
+reports.anomaly        #my-reports     urgent   push
+reports                #my-reports     fyi
+
+# Writing / content
+writing.draft_ready    #my-content     ask
+writing.blocked        #my-content     ask
+writing                #my-content     fyi
+
+# Projects / builds
+projects.shipped       #my-projects    fyi
+projects.blocked       #my-projects    ask
+projects               #my-projects    fyi
+
+# Ops / infra (loud — these wake you)
+ops.deploy_fail        #my-ops         urgent   push
+ops.cred_expiring      #my-ops         ask
+
+# Truly private 1:1 → DM (needs PSLACK_DM_USER set)
+private                DM              ask
+
+# Fallback (do not delete)
+default                #my-misc        fyi

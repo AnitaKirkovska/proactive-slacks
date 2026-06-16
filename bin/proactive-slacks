@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""proactive-slacks — let your assistant reach you on Slack, on purpose.
+
+One routing table maps a *topic* to a *channel* and a *level*. One call sends a
+message through it. A companion heartbeat (see SKILL.md) wakes on a schedule,
+checks what changed, and pings you only on a real delta.
+
+    proactive-slacks <topic> "<message>"
+    proactive-slacks <topic> "<message>" --level ask
+    proactive-slacks --list
+    proactive-slacks <topic> "<message>" --dry-run
+
+The routing table is plain text so a human can edit it without a rebuild:
+
+    <topic>   <channel>   <level>   [push]
+
+    topic    a dotted name you choose (signups.daily, writing.draft_ready)
+    channel  a #channel-name  OR  DM
+    level    silent | fyi | ask | urgent   (how LOUD, independent of channel)
+    push     optional 4th word: force a lock-screen push regardless of level
+
+Levels:
+    silent  log only, no message
+    fyi     post, no push
+    ask      post; the message should lead with what you need from the human
+    urgent  post + lock-screen push
+
+A topic with no row falls back to its parent category, then to `default`.
+Nothing is ever silently dropped.
+
+Configuration (env vars, all optional — defaults shown):
+    PSLACK_TABLE   path to the routing table   (./config/notifications.txt)
+    PSLACK_LOG     path to the audit log        (./logs/notify.log)
+    PSLACK_DM_USER Slack user ID for DM routing (required for DM rows)
+    PSLACK_TOKEN   Slack bot token. If unset, falls back to PSLACK_TOKEN_CMD.
+    PSLACK_TOKEN_CMD  a shell command that prints the token on stdout
+                      (e.g. a secrets-manager reveal). Keeps tokens out of env.
+    PSLACK_PUSH_CMD   optional shell command for lock-screen push; receives the
+                      message as its last arg. If unset, urgent just posts.
+
+Slack scopes needed on the bot token: chat:write (+ chat:write.public or an
+invite to each target channel), im:write for DM rows.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+VALID_LEVELS = {"silent", "fyi", "ask", "urgent"}
+
+
+def _here() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def table_path() -> Path:
+    return Path(os.environ.get("PSLACK_TABLE", _here() / "config" / "notifications.txt"))
+
+
+def log_path() -> Path:
+    return Path(os.environ.get("PSLACK_LOG", _here() / "logs" / "notify.log"))
+
+
+# ---------- table ----------
+
+def load_table():
+    rows = {}
+    p = table_path()
+    if not p.exists():
+        return rows
+    for raw in p.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        topic, channel, level = parts[0], parts[1], parts[2].lower()
+        push = len(parts) >= 4 and parts[3].lower() == "push"
+        rows[topic] = {"channel": channel, "level": level, "push": push}
+    return rows
+
+
+def resolve(topic, table):
+    if topic in table:
+        return topic, table[topic]
+    if "." in topic:
+        parent = topic.split(".", 1)[0]
+        if parent in table:
+            return parent, table[parent]
+    if "default" in table:
+        return "default", table["default"]
+    return "default", {"channel": "DM", "level": "fyi", "push": False}
+
+
+# ---------- token ----------
+
+def get_token():
+    tok = os.environ.get("PSLACK_TOKEN")
+    if tok:
+        return tok.strip()
+    cmd = os.environ.get("PSLACK_TOKEN_CMD")
+    if cmd:
+        return subprocess.check_output(cmd, shell=True, text=True).strip()
+    sys.exit("proactive-slacks: no token. Set PSLACK_TOKEN or PSLACK_TOKEN_CMD.")
+
+
+# ---------- slack ----------
+
+def http(url, *, body, token):
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"http {e.code}: {e.read()[:200]!r}"}
+    except Exception as e:  # network, timeout, etc.
+        return {"ok": False, "error": str(e)}
+
+
+def post_channel(token, channel, text):
+    return http("https://slack.com/api/chat.postMessage",
+                body={"channel": channel, "text": text, "unfurl_links": True},
+                token=token)
+
+
+def post_dm(token, text):
+    user = os.environ.get("PSLACK_DM_USER")
+    if not user:
+        return {"ok": False, "error": "DM row but PSLACK_DM_USER is unset"}
+    opened = http("https://slack.com/api/conversations.open",
+                  body={"users": user}, token=token)
+    ch = (opened.get("channel") or {}).get("id")
+    if not ch:
+        return {"ok": False, "error": f"open dm failed: {opened.get('error')}"}
+    return post_channel(token, ch, text)
+
+
+def push_lockscreen(text):
+    cmd = os.environ.get("PSLACK_PUSH_CMD")
+    if not cmd:
+        return None  # no push backend configured
+    try:
+        full = shlex.split(cmd) + [text]
+        r = subprocess.run(full, capture_output=True, text=True, timeout=30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# ---------- log ----------
+
+def log(topic, route, level, result, message):
+    p = log_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "topic": topic, "route": route, "level": level,
+        "result": result, "message": message[:200],
+    }
+    with p.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+# ---------- main ----------
+
+def main():
+    ap = argparse.ArgumentParser(prog="proactive-slacks")
+    ap.add_argument("topic", nargs="?")
+    ap.add_argument("message", nargs="?")
+    ap.add_argument("--level", choices=sorted(VALID_LEVELS),
+                    help="override the table's level for this call")
+    ap.add_argument("--push", action="store_true",
+                    help="force a lock-screen push on top of the routed message")
+    ap.add_argument("--list", action="store_true", help="print the routing table")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="resolve + print the route, send nothing")
+    args = ap.parse_args()
+
+    table = load_table()
+
+    if args.list:
+        for t, cfg in table.items():
+            extra = " +push" if cfg["push"] else ""
+            print(f"  {t:24} {cfg['channel']:18} {cfg['level']}{extra}")
+        return
+
+    if not args.topic or not args.message:
+        ap.error("need <topic> and <message> (or --list)")
+
+    name, cfg = resolve(args.topic, table)
+    level = args.level or cfg["level"]
+    if level not in VALID_LEVELS:
+        level = "fyi"
+    channel = cfg["channel"]
+    want_push = args.push or cfg["push"] or level == "urgent"
+
+    if args.dry_run:
+        print(json.dumps({"topic": args.topic, "matched": name, "channel": channel,
+                          "level": level, "push": want_push}, indent=2))
+        return
+
+    if level == "silent":
+        log(args.topic, name, level, "silent", args.message)
+        print(f"silent: logged {args.topic}")
+        return
+
+    token = get_token()
+
+    # channel decides WHERE, level decides HOW LOUD — independent.
+    if channel == "DM":
+        res = post_dm(token, args.message)
+        route = "DM"
+    else:
+        res = post_channel(token, channel, args.message)
+        route = channel
+
+    ok = res.get("ok", False)
+    pushed = None
+    if want_push:
+        pushed = push_lockscreen(args.message)
+
+    result = "sent" if ok else f"FAILED:{res.get('error')}"
+    if want_push and pushed is not None:
+        result += f" push={'ok' if pushed else 'fail'}"
+    log(args.topic, route, level, result, args.message)
+    flag = " +push" if want_push else ""
+    print(f"{args.topic} -> {route} ({level}){flag}: {result}")
+    if not ok:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

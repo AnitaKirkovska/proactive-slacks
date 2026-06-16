@@ -1,0 +1,8 @@
+{
+  "_comment": "Starter state for the heartbeat. The heartbeat compares this against your assistant's source of truth (notes / tasks / threads) and pings only on a delta, then writes the new state back here. Seed it once with your current threads so the first wakes don't re-announce everything already in flight.",
+  "updated": "2025-01-01T00:00:00Z",
+  "threads": {
+    "example-draft": {"state": "in_progress", "topic": "writing.draft_ready", "last_pinged": null},
+    "example-build": {"state": "blocked_on_input", "topic": "projects.blocked", "last_pinged": null}
+  }
+}
