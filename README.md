@@ -1,6 +1,10 @@
-# proactive-slacks
+<p align="center">
+  <img src="assets/icon-256.png" width="128" height="128" alt="proactive-slacks icon">
+</p>
 
-Let an AI assistant reach you on Slack **on purpose** — without becoming a noise machine.
+<h1 align="center">proactive-slacks</h1>
+
+<p align="center">Let an AI assistant reach you on Slack <b>on purpose</b> — without becoming a noise machine.</p>
 
 Most assistants are silent until you message them. This is a small plugin that
 gives yours a way to reach out first: when a draft is ready, when a build is
